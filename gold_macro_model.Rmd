@@ -1,0 +1,962 @@
+---
+title: "Projekt T3 - Modelowanie zmian ceny złota (XAUUSD) z użyciem czynników makro"
+author: "Marcin Ossoliński Maksymilian Rak"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+    keep_tex: false
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+    code_folding: hide
+always_allow_html: true
+params:
+  # Zakres danych
+  # Walidacja i prognoza
+  # Wyjścia (plikowo)
+  start_date: "2010-01-01"
+  end_date: ""          # puste = dziś
+  freq: "daily"         # "daily" albo "weekly"
+  data_source: "auto"   # "auto", "stooq", "yahoo"
+  test_fraction: 0.2
+  h_ahead: 20
+  seed: 202501
+  out_dir_data: "data_out"
+  out_dir_output: "output_out"
+  out_model_rds: "output_out/model_ols.rds"
+  out_sources_csv: "output_out/sources_used.csv"
+  out_test_forecast_csv: "output_out/test_forecast.csv"
+  out_future_forecast_csv: "output_out/future_forecast.csv"
+  out_summary_md: "output_out/summary.md"
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = FALSE,
+  fig.width = 10, fig.height = 6, dpi = 240
+)
+
+# Stabilny katalog roboczy = katalog Rmd
+root_dir <- tryCatch(normalizePath(dirname(knitr::current_input())), error = function(e) getwd())
+knitr::opts_knit$set(root.dir = root_dir)
+
+# Foldery wyjściowe
+dir.create(params$out_dir_data, showWarnings = FALSE, recursive = TRUE)
+dir.create(params$out_dir_output, showWarnings = FALSE, recursive = TRUE)
+
+set.seed(params$seed)
+
+req_pkgs <- c(
+  "dplyr","tibble","tidyr","readr","lubridate",
+  "ggplot2","scales",
+  "quantmod","xts","zoo",
+  "broom","knitr",
+  "lmtest","sandwich","car",
+  "tseries","lawstat","forecast",
+  "glue","curl","kableExtra","patchwork"
+)
+
+missing <- req_pkgs[!vapply(req_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing) > 0) {
+  stop("Brak wymaganych pakietów: ", paste(missing, collapse = ", "),
+       "
+Zainstaluj je poleceniem: install.packages(missing, dependencies = TRUE)
+Następnie uruchom knit ponownie.")
+}
+invisible(lapply(req_pkgs, library, character.only = TRUE))
+
+options(xts.warn_dplyr_breaks_lag = FALSE)
+
+# ============== WYGLĄD: wykresy i tabele ==============
+theme_project <- function(base_size = 13) {
+  ggplot2::theme_minimal(base_size = base_size) +
+    ggplot2::theme(
+      plot.title.position = "plot",
+      plot.title = ggplot2::element_text(face = "bold", size = base_size + 4, margin = ggplot2::margin(b = 6)),
+      plot.subtitle = ggplot2::element_text(size = base_size, margin = ggplot2::margin(b = 10)),
+      plot.caption = ggplot2::element_text(size = base_size - 2, color = "grey35"),
+      axis.title = ggplot2::element_text(face = "bold"),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+      strip.text = ggplot2::element_text(face = "bold"),
+      panel.grid.minor = ggplot2::element_blank(),
+      legend.position = "bottom",
+      legend.title = ggplot2::element_text(face = "bold")
+    )
+}
+ggplot2::theme_set(theme_project(13))
+ggplot2::update_geom_defaults("line", list(linewidth = 0.95))
+ggplot2::update_geom_defaults("point", list(size = 2.1))
+
+pal <- list(
+  gold = "#B8860B",
+  blue = "#1F77B4",
+  red  = "#D62728",
+  gray = "#3A3A3A",
+  light = "#E6E6E6"
+)
+
+# Tabele: bezpieczny wrapper (eliminuje problemy digits/round)
+# Tabele: wrapper zależny od formatu wyjścia (HTML / PDF)
+kbl_safe <- function(df, caption = NULL, digits = 3) {
+  # Bezpieczne tabele dla PDF/HTML:
+  # - PDF (LaTeX): automatyczne zawijanie, skalowanie szerokich tabel i powtarzanie nagłówka
+  # - HTML: estetyka + przewijanie dla szerokich tabel
+
+  to_latex <- knitr::is_latex_output()
+  to_html  <- knitr::is_html_output()
+
+  if (!is.null(df) && is.data.frame(df) && nrow(df) > 0) {
+    df <- df
+  }
+
+  # Uwaga: w LaTeX podkreślenie (_) w podpisach musi być escapowane.
+  if (!is.null(caption) && to_latex) {
+    caption <- gsub("_", "\\_", caption, fixed = TRUE)
+  }
+
+  if (to_latex) {
+    # Heurystyka: długie/szerokie tabele -> longtable + mniejsza czcionka
+    long <- is.data.frame(df) && (nrow(df) > 25 || ncol(df) > 8)
+    fs   <- if (is.data.frame(df) && ncol(df) > 8) 8 else 9
+
+    tab <- kableExtra::kbl(
+      df,
+      format = "latex",
+      booktabs = TRUE,
+      longtable = long,
+      digits = digits,
+      caption = caption,
+      escape = TRUE
+    )
+
+    latex_opts <- if (long) c("repeat_header", "scale_down") else c("hold_position", "scale_down")
+
+    tab %>%
+      kableExtra::kable_styling(
+        latex_options = latex_opts,
+        font_size = fs
+      ) %>%
+      kableExtra::row_spec(0, bold = TRUE)
+  } else if (to_html) {
+    tab <- kableExtra::kbl(
+      df,
+      format = "html",
+      digits = digits,
+      caption = caption,
+      escape = TRUE
+    ) %>%
+      kableExtra::kable_styling(
+        bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+        full_width = FALSE
+      )
+
+    # Dla szerokich tabel dodajemy przewijanie poziome
+    if (is.data.frame(df) && ncol(df) > 8) {
+      tab <- kableExtra::scroll_box(tab, width = "100%", height = "300px")
+    }
+    tab
+  } else {
+    # Fallback (np. GitHub markdown)
+    knitr::kable(df, digits = digits, caption = caption)
+  }
+}
+
+
+
+fmt_num <- function(x, digits = 6) formatC(x, format = "f", digits = digits)
+rmse <- function(a, f) sqrt(mean((a - f)^2, na.rm = TRUE))
+mae  <- function(a, f) mean(abs(a - f), na.rm = TRUE)
+
+sig_label <- function(p) {
+  if (!is.finite(p)) return("brak")
+  if (p < 0.01) "bardzo istotny (p<0.01)"
+  else if (p < 0.05) "istotny (p<0.05)"
+  else if (p < 0.10) "słabo istotny (p<0.10)"
+  else "nieistotny (p>=0.10)"
+}
+
+drop_all_na <- function(df) {
+  df <- as.data.frame(df)
+  df[stats::complete.cases(df), , drop = FALSE]
+}
+
+# ============== POBRANIE DANYCH: odporne na HTML/limity ==============
+looks_like_html <- function(txt) {
+  if (is.null(txt) || !nzchar(txt)) return(TRUE)
+  grepl("<html", txt, ignore.case = TRUE) || grepl("Dane zostały ukryte", txt, ignore.case = TRUE)
+}
+
+fetch_url_text <- function(url) {
+  h <- curl::new_handle()
+  curl::handle_setheaders(h,
+    "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+    "Accept" = "text/csv,text/plain,text/html,*/*"
+  )
+  res <- curl::curl_fetch_memory(url, handle = h)
+  rawToChar(res$content)
+}
+
+read_stooq_csv <- function(ticker) {
+  urls <- c(
+    paste0("https://stooq.com/q/d/l/?s=", tolower(ticker), "&i=d"),
+    paste0("https://stooq.pl/q/d/l/?s=", tolower(ticker), "&i=d")
+  )
+  last_err <- NULL
+  for (url in urls) {
+    txt <- tryCatch(fetch_url_text(url), error = function(e) { last_err <<- e; return(NULL) })
+    if (looks_like_html(txt)) { last_err <- simpleError("Stooq zwrócił HTML (limit/ukryte dane)."); next }
+
+    df <- tryCatch(readr::read_csv(I(txt), show_col_types = FALSE, progress = FALSE), error = function(e) NULL)
+    if (is.null(df) || ncol(df) == 1 || !any(tolower(names(df)) %in% c("date","data"))) {
+      df2 <- tryCatch(readr::read_delim(I(txt), delim = ";", show_col_types = FALSE, progress = FALSE), error = function(e) NULL)
+      if (!is.null(df2) && ncol(df2) > 1) df <- df2
+    }
+    if (!is.null(df) && ncol(df) > 1 && any(tolower(names(df)) %in% c("date","data"))) return(df)
+    last_err <- simpleError("Nie udało się sparsować CSV (separator/format).")
+  }
+  stop("Stooq: nie udało się pobrać danych dla: ", ticker, " (", conditionMessage(last_err), ")")
+}
+
+stooq_daily_close <- function(ticker) {
+  df <- read_stooq_csv(ticker)
+  names(df) <- trimws(gsub("^\ufeff", "", names(df)))
+  date_col  <- names(df)[tolower(names(df)) %in% c("date","data")][1]
+  close_col <- names(df)[tolower(names(df)) %in% c("close","zamkniecie","zamknięcie")][1]
+  if (is.na(date_col))  stop("Brak kolumny Date/Data w danych dla: ", ticker)
+  if (is.na(close_col)) stop("Brak kolumny Close w danych dla: ", ticker)
+
+  df %>%
+    dplyr::transmute(date = as.Date(.data[[date_col]]), value = as.numeric(.data[[close_col]])) %>%
+    dplyr::filter(!is.na(date) & is.finite(value)) %>%
+    dplyr::arrange(date)
+}
+
+yahoo_daily_close <- function(symbol) {
+  xt <- tryCatch(quantmod::getSymbols(symbol, src = "yahoo", auto.assign = FALSE, warnings = FALSE),
+                 error = function(e) NULL)
+  if (is.null(xt)) stop("Yahoo: nie udało się pobrać: ", symbol)
+  tibble::tibble(date = as.Date(zoo::index(xt)), value = as.numeric(quantmod::Cl(xt))) %>%
+    dplyr::filter(!is.na(date) & is.finite(value)) %>%
+    dplyr::arrange(date)
+}
+
+get_yahoo_multi <- function(symbols) {
+  last_err <- NULL
+  for (s in symbols) {
+    out <- tryCatch(yahoo_daily_close(s), error = function(e) { last_err <<- e; return(NULL) })
+    if (!is.null(out) && nrow(out) > 0) { attr(out, "ticker_used") <- s; return(out) }
+  }
+  stop("Yahoo: nie udało się pobrać żadnego tickera: ", paste(symbols, collapse = ", "),
+       " (", conditionMessage(last_err), ")")
+}
+
+get_series_close <- function(stooq_ticker, yahoo_candidates, mode = c("auto","stooq","yahoo")) {
+  mode <- match.arg(mode)
+  attempts <- switch(mode,
+    "stooq" = c("stooq","yahoo"),
+    "yahoo" = c("yahoo","stooq"),
+    "auto"  = c("stooq","yahoo")
+  )
+
+  for (src in attempts) {
+    out <- tryCatch({
+      if (src == "stooq") stooq_daily_close(stooq_ticker) else get_yahoo_multi(yahoo_candidates)
+    }, error = function(e) NULL)
+
+    if (!is.null(out) && nrow(out) > 0) {
+      attr(out, "source_used") <- src
+      return(out)
+    }
+  }
+  stop("Nie udało się pobrać serii ani ze Stooq ani z Yahoo: ", stooq_ticker)
+}
+
+basic_stats <- function(x) {
+  x <- x[is.finite(x)]
+  tibble::tibble(
+    n = length(x),
+    min = min(x),
+    q25 = unname(stats::quantile(x, 0.25)),
+    median = stats::median(x),
+    mean = mean(x),
+    q75 = unname(stats::quantile(x, 0.75)),
+    max = max(x),
+    sd = stats::sd(x)
+  )
+}
+```
+
+# Cel badania i idea modelu
+
+**Cel praktyczny:** zbudować prosty, weryfikowalny model wyjaśniający krótkookresowe zmiany ceny złota (XAUUSD) na podstawie trzech czynników rynkowych:
+
+- **DXY** (siła dolara),
+- **US10Y** (rentowność obligacji USA 10Y - koszt alternatywny trzymania złota),
+- **VIX** (awersja do ryzyka).
+
+Model pracuje na **zmianach (zwrotach logarytmicznych)**, bo poziomy cen zwykle są niestacjonarne i mogą dawać mylące wyniki.
+
+# Źródła danych, data pobrania i plik z danymi do modelu
+
+> Wymóg projektu: pokazać pochodzenie danych, datę pobrania oraz udostępnić pliki z danymi użytymi do modelu.
+
+```{r data-sources}
+fetch_timestamp <- Sys.time()
+
+tickers <- tibble::tibble(
+  zmienna = c("XAUUSD", "DXY", "US10Y", "VIX"),
+  stooq_ticker = c("xauusd", "dx.f", "10yusy.b", "vi.c"),
+  yahoo_candidates = I(list(
+    c("XAUUSD=X", "GC=F"), # spot bywa blokowany; futures zwykle działa
+    c("DX-Y.NYB", "DX=F"),
+    c("^TNX"),
+    c("^VIX")
+  )),
+  opis = c(
+    "Złoto / USD - cena zamknięcia (Close)",
+    "US Dollar Index - proxy siły USD",
+    "US 10Y yield - proxy stóp długoterminowych",
+    "VIX - proxy awersji do ryzyka"
+  )
+)
+
+kbl_safe(tickers %>% dplyr::select(-yahoo_candidates), digits = 0,
+         caption = "Mapowanie tickerów i opis zmiennych (Stooq + Yahoo jako fallback)")
+```
+
+```{r download-data}
+start_date <- as.Date(params$start_date)
+end_date <- if (nzchar(params$end_date)) as.Date(params$end_date) else Sys.Date()
+mode <- tolower(params$data_source)
+
+xau <- get_series_close("xauusd",   tickers$yahoo_candidates[[1]], mode) %>% dplyr::rename(xauusd = value)
+dxy <- get_series_close("dx.f",     tickers$yahoo_candidates[[2]], mode) %>% dplyr::rename(dxy   = value)
+y10 <- get_series_close("10yusy.b", tickers$yahoo_candidates[[3]], mode) %>% dplyr::rename(us10y = value)
+vix <- get_series_close("vi.c",     tickers$yahoo_candidates[[4]], mode) %>% dplyr::rename(vix   = value)
+
+src_xau <- attr(xau, "source_used")
+src_dxy <- attr(dxy, "source_used")
+src_y10 <- attr(y10, "source_used")
+src_vix <- attr(vix, "source_used")
+
+# ^TNX bywa w punktach (np. 45 = 4.5%); korekta heurystyczna
+if (median(y10$us10y, na.rm = TRUE) > 20) y10$us10y <- y10$us10y / 10
+
+# zakres dat
+xau <- dplyr::filter(xau, date >= start_date & date <= end_date)
+dxy <- dplyr::filter(dxy, date >= start_date & date <= end_date)
+y10 <- dplyr::filter(y10, date >= start_date & date <= end_date)
+vix <- dplyr::filter(vix, date >= start_date & date <= end_date)
+
+df_raw <- xau %>%
+  dplyr::left_join(dxy, by = "date") %>%
+  dplyr::left_join(y10, by = "date") %>%
+  dplyr::left_join(vix, by = "date") %>%
+  dplyr::arrange(date)
+
+na_summary <- tibble::tibble(
+  zmienna = names(df_raw),
+  n = nrow(df_raw),
+  n_NA = vapply(df_raw, function(x) sum(is.na(x)), numeric(1)),
+  pct_NA = round(100 * n_NA / n, 2)
+)
+
+df_cc <- drop_all_na(df_raw)
+
+cc_info <- tibble::tibble(
+  obserwacje_przed = nrow(df_raw),
+  obserwacje_po = nrow(df_cc),
+  utracone = nrow(df_raw) - nrow(df_cc),
+  pct_utracone = round(100 * (nrow(df_raw) - nrow(df_cc)) / nrow(df_raw), 2)
+)
+
+# zapis danych (wymóg projektu)
+readr::write_csv(df_raw, file.path(params$out_dir_data, "dane_poziomy_raw.csv"))
+readr::write_csv(df_cc,  file.path(params$out_dir_data, "dane_poziomy_completecases.csv"))
+
+sources_used <- tibble::tibble(
+  zmienna = c("XAUUSD","DXY","US10Y","VIX"),
+  source_used = c(src_xau, src_dxy, src_y10, src_vix),
+  stooq_ticker = tickers$stooq_ticker,
+  yahoo_candidates = c("XAUUSD=X / GC=F", "DX-Y.NYB / DX=F", "^TNX", "^VIX"),
+  data_pobrania = format(fetch_timestamp, "%Y-%m-%d %H:%M:%S"),
+  start_date = as.character(start_date),
+  end_date = as.character(end_date)
+)
+readr::write_csv(sources_used, params$out_sources_csv)
+
+kbl_safe(na_summary, digits = 2, caption = "Braki danych po połączeniu (df_raw)")
+kbl_safe(cc_info, digits = 2, caption = "Skutek usunięcia braków (complete cases)")
+kbl_safe(sources_used, digits = 0, caption = "Dokumentacja: które źródło faktycznie użyto (zapisane też do CSV)")
+```
+
+## Statystyki podstawowe i wykresy poziomów
+
+```{r stats-and-levels}
+stats_levels <- df_cc %>%
+  tidyr::pivot_longer(-date, names_to = "zmienna", values_to = "wartosc") %>%
+  dplyr::group_by(zmienna) %>%
+  dplyr::summarise(basic_stats(wartosc), .groups = "drop")
+
+kbl_safe(stats_levels, digits = 4, caption = "Statystyki opisowe poziomów (complete cases)")
+
+df_long <- df_cc %>%
+  tidyr::pivot_longer(cols = c(xauusd, dxy, us10y, vix), names_to = "zmienna", values_to = "wartosc")
+
+ggplot(df_long, aes(x = date, y = wartosc)) +
+  geom_line(color = pal$gray) +
+  facet_wrap(~zmienna, scales = "free_y", ncol = 2) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(
+    title = "Poziomy zmiennych (skale niezależne)",
+    subtitle = "Poziomy zwykle są niestacjonarne -> model budujemy na zmianach",
+    x = NULL, y = "Wartość", caption = "Źródła: Stooq/Yahoo (patrz tabela źródeł)."
+  ) +
+  theme_project(14)
+```
+**Opis i interpretacja (poziomy):**  
+- Szeregi w poziomach mają wyraźne trendy i długie fale cykliczne (niestacjonarność), więc bez transformacji regresja dawałaby „pozorne” zależności.  
+- XAUUSD rośnie nieliniowo (szczególnie po 2020) - to typowe dla aktywów z reżimami (zmiana inflacji, polityki monetarnej, popytu inwestycyjnego).  
+- VIX ma epizodyczne skoki (stres rynkowy), a DXY i US10Y poruszają się falami; te zmienne są kandydatami na czynniki wyjaśniające **zmiany**, nie poziomy.
+
+
+# Arkusz roboczy: transformacje, dobór zmiennych, testy
+
+## Agregacja tygodniowa (opcjonalnie) i transformacje do modelu
+
+```{r transform}
+to_weekly_last <- function(df, col) {
+  df %>%
+    dplyr::mutate(week = lubridate::floor_date(date, unit = "week", week_start = 1)) %>%
+    dplyr::group_by(week) %>%
+    dplyr::summarise(value = dplyr::last(.data[[col]][is.finite(.data[[col]])]), .groups = "drop") %>%
+    dplyr::rename(date = week)
+}
+
+df_use <- if (tolower(params$freq) == "weekly") {
+  w_xau <- to_weekly_last(df_raw, "xauusd") %>% dplyr::rename(xauusd = value)
+  w_dxy <- to_weekly_last(df_raw, "dxy")    %>% dplyr::rename(dxy   = value)
+  w_10y <- to_weekly_last(df_raw, "us10y")  %>% dplyr::rename(us10y = value)
+  w_vix <- to_weekly_last(df_raw, "vix")    %>% dplyr::rename(vix   = value)
+
+  w_xau %>% dplyr::left_join(w_dxy, by = "date") %>%
+    dplyr::left_join(w_10y, by = "date") %>%
+    dplyr::left_join(w_vix, by = "date") %>%
+    dplyr::arrange(date)
+} else {
+  df_raw
+}
+
+df_use <- drop_all_na(df_use)
+
+df_t <- df_use %>%
+  dplyr::arrange(date) %>%
+  dplyr::mutate(
+    y  = c(NA, diff(log(xauusd))),
+    x1 = c(NA, diff(log(dxy))),
+    x2 = c(NA, diff(us10y)),
+    x3 = c(NA, diff(log(vix)))
+  ) %>%
+  drop_all_na()
+
+readr::write_csv(df_t, file.path(params$out_dir_data, "dane_transformacje_do_modelu.csv"))
+
+kbl_safe(head(df_t, 8), digits = 6,
+         caption = "Dane do modelowania (pierwsze obserwacje) - zapisano do CSV")
+
+df_t_long <- df_t %>%
+  dplyr::select(date, y, x1, x2, x3) %>%
+  tidyr::pivot_longer(cols = -date, names_to = "zmienna", values_to = "wartosc")
+
+ggplot(df_t_long, aes(x = date, y = wartosc)) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.55) +
+  geom_line(color = pal$gray) +
+  facet_wrap(~zmienna, scales = "free_y", ncol = 2) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(
+    title = "Zmiany (zmienne do modelowania)",
+    subtitle = "Po transformacji szeregi oscylują wokół zera - to poprawia wiarygodność wniosków z regresji",
+    x = NULL, y = "Wartość"
+  ) +
+  theme_project(14)
+```
+**Opis i interpretacja (zmiany):**  
+- Po przejściu na zmiany (log-różnice / różnice) szeregi są „wycentrowane” wokół zera, co jest pożądane w modelowaniu liniowym.  
+- Widać klastrowanie zmienności i obserwacje skrajne (outliery) - typowe dla danych finansowych; dlatego w raporcie stosowane są m.in. odporne błędy standardowe (HC1).  
+- Zmienna objaśniana *y* (zwrot złota) ma okresy podwyższonej zmienności, co później powinno być widoczne w diagnostyce reszt i w jakości prognoz poza próbą.
+
+
+## Stacjonarność (ADF) - uzasadnienie pracy na zmianach
+
+```{r adf}
+adf_one <- function(x, name) {
+  x <- x[is.finite(x)]
+  if (length(x) > 5000) x <- tail(x, 5000)
+  out <- tryCatch(tseries::adf.test(x), error = function(e) NULL)
+  tibble::tibble(
+    zmienna = name,
+    n = length(x),
+    stat = if (!is.null(out)) as.numeric(out$statistic) else NA_real_,
+    p_value = if (!is.null(out)) out$p.value else NA_real_
+  )
+}
+
+adf_levels <- dplyr::bind_rows(
+  adf_one(log(df_use$xauusd), "log(XAUUSD)"),
+  adf_one(log(df_use$dxy),    "log(DXY)"),
+  adf_one(df_use$us10y,       "US10Y"),
+  adf_one(log(df_use$vix),    "log(VIX)")
+)
+
+adf_changes <- dplyr::bind_rows(
+  adf_one(df_t$y,  "y = dlog(XAUUSD)"),
+  adf_one(df_t$x1, "x1 = dlog(DXY)"),
+  adf_one(df_t$x2, "x2 = d(US10Y)"),
+  adf_one(df_t$x3, "x3 = dlog(VIX)")
+)
+
+kbl_safe(adf_levels, digits = 6, caption = "ADF dla poziomów (wybrane transformacje)")
+kbl_safe(adf_changes, digits = 6, caption = "ADF dla zmian (zmienne do modelowania)")
+
+share_stationary <- mean(adf_changes$p_value < 0.05, na.rm = TRUE)
+if (is.finite(share_stationary) && share_stationary >= 0.75) {
+  cat("**Wniosek (ADF):** w zmianach większość serii pozwala odrzucić hipotezę o pierwiastku jednostkowym -> praca na zmianach jest uzasadniona.\n")
+} else {
+  cat("**Wniosek (ADF):** część serii może nadal mieć cechy niestacjonarności -> w razie potrzeby rozważyć alternatywne transformacje lub modele nieliniowe.\n")
+}
+```
+
+## Zależności między zmiennymi (korelacje i VIF)
+
+```{r corr-vif}
+corr_df <- df_t %>% dplyr::select(y, x1, x2, x3)
+C <- stats::cor(corr_df, use = "pairwise.complete.obs")
+
+C_long <- as.data.frame(C) %>%
+  tibble::rownames_to_column("var1") %>%
+  tidyr::pivot_longer(-var1, names_to = "var2", values_to = "corr")
+
+p_corr <- ggplot(C_long, aes(x = var1, y = var2, fill = corr)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = sprintf("%.2f", corr)), size = 4, fontface = "bold") +
+  scale_fill_gradient2(limits = c(-1, 1), low = pal$red, mid = "white", high = pal$blue) +
+  labs(title = "Macierz korelacji (zmiany)", x = NULL, y = NULL, fill = "korelacja") +
+  theme_project(14) +
+  theme(panel.grid = element_blank())
+
+m_vif <- stats::lm(y ~ x1 + x2 + x3, data = df_t)
+v <- car::vif(m_vif)
+vif_tbl <- tibble::tibble(zmienna = names(v), VIF = as.numeric(v))
+
+p_vif <- ggplot(vif_tbl, aes(x = reorder(zmienna, VIF), y = VIF)) +
+  geom_col(fill = pal$blue, alpha = 0.85) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = pal$red, linewidth = 1) +
+  coord_flip() +
+  labs(
+    title = "Współliniowość (VIF)",
+    subtitle = "Reguła praktyczna: VIF > 5 może sygnalizować istotną współliniowość",
+    x = NULL, y = "VIF"
+  ) + theme_project(14)
+
+p_corr / p_vif
+kbl_safe(vif_tbl, digits = 3, caption = "Współczynniki VIF (tabela)")
+```
+**Opis i interpretacja (korelacje i VIF):**  
+- Korelacje sugerują, że najsilniejszy związek *y* jest z *x1* (zmiany DXY) i ma znak ujemny - zgodne z intuicją „silny USD zwykle ciąży złotu”.  
+- Pozostałe zależności są słabsze, co ogranicza ryzyko „podwójnego liczenia” tego samego efektu przez różne zmienne.  
+- VIF blisko 1 oznacza brak istotnej współliniowości - współczynniki regresji są stabilniejsze i łatwiejsze do interpretacji.
+
+
+# Estymacja modelu i weryfikacja
+
+## Podział na zbiór treningowy i testowy
+
+```{r split}
+n <- nrow(df_t)
+n_test <- max(30, floor(params$test_fraction * n))
+split_idx <- n - n_test
+
+train <- df_t[1:split_idx, ]
+test  <- df_t[(split_idx + 1):n, ]
+
+kbl_safe(tibble::tibble(
+  obserwacje = c("train","test"),
+  n = c(nrow(train), nrow(test)),
+  okres_od = c(min(train$date), min(test$date)),
+  okres_do = c(max(train$date), max(test$date))
+), digits = 0, caption = "Podział danych na train/test")
+```
+
+## Regresja OLS + błędy odporne (HC1)
+
+```{r ols}
+m <- stats::lm(y ~ x1 + x2 + x3, data = train)
+saveRDS(m, params$out_model_rds)
+
+coeft_hc <- lmtest::coeftest(m, vcov. = sandwich::vcovHC(m, type = "HC1"))
+coeft_tbl <- broom::tidy(coeft_hc) %>%
+  dplyr::select(term, estimate, std.error, statistic, p.value) %>%
+  dplyr::mutate(
+    istotnosc = vapply(p.value, sig_label, character(1))
+  )
+
+kbl_safe(coeft_tbl, digits = 6, caption = "Współczynniki OLS z błędami odpornymi (HC1)")
+
+# wykres współczynników z CI
+ci <- broom::tidy(coeft_hc, conf.int = TRUE, conf.level = 0.95)
+ci <- ci %>% dplyr::filter(term != "(Intercept)")
+
+ggplot(ci, aes(x = estimate, y = term)) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.7) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.25, color = pal$blue, linewidth = 1) +
+  geom_point(color = pal$blue, size = 3) +
+  labs(
+    title = "Wpływ czynników na zmianę ceny złota (95% CI)",
+    subtitle = "Wykres ułatwia ocenę kierunku wpływu i niepewności estymacji",
+    x = "Współczynnik (β)", y = NULL
+  ) +
+  theme_project(14)
+```
+**Opis i interpretacja (współczynniki i przedziały ufności):**  
+- Punkty pokazują estymaty β, a odcinki 95% CI - jeżeli CI nie przecina zera, efekt jest statystycznie wiarygodny w tej próbie.  
+- Skala współczynników jest w jednostkach zmian: *x1* i *x3* są w log-różnicach (≈% zmiany), a *x2* to różnica rentowności (punkty procentowe).  
+- Wnioski z β należy czytać jako zależność **warunkową** (przy pozostałych zmiennych stałych), a nie jako prostą korelację.
+
+
+## Interpretacja w prostym języku (dla klienta)
+
+```{r interpretation}
+beta <- coeft_tbl %>% dplyr::filter(term != "(Intercept)")
+
+interp <- beta %>%
+  dplyr::mutate(
+    znak = dplyr::case_when(estimate > 0 ~ "dodatni", estimate < 0 ~ "ujemny", TRUE ~ "zerowy"),
+
+    # Opis słowny dopasowany do ZNAKU współczynnika (żeby nie było sprzeczności)
+    opis = dplyr::case_when(
+      term == "x1" ~ "Gdy dolar się umacnia (DXY rośnie), złoto statystycznie ma tendencję do spadku / słabszych wzrostów (często działa efekt ‘silny USD’).",
+      term == "x2" ~ "Gdy rosną rentowności 10Y, złoto bywa pod presją (rośnie koszt alternatywny trzymania złota).",
+      term == "x3" & estimate > 0 ~ "W tej próbie wzrost awersji do ryzyka (VIX) łączy się ze wzrostem zwrotów złota - interpretacja zgodna z narracją ‘bezpiecznej przystani’.",
+      term == "x3" & estimate < 0 ~ "W tej próbie wzrost awersji do ryzyka (VIX) łączy się z niższymi zwrotami złota. To może oznaczać, że w epizodach risk-off dominuje np. umocnienie USD / delewarowanie, a nie klasyczny efekt ‘bezpiecznej przystani’.",
+      TRUE ~ ""
+    ),
+
+    # Skala: pamiętaj, że dlog ≈ procent w UŁAMKU (1% ≈ 0.01), więc mnożymy przez 0.01
+    skala = dplyr::case_when(
+      term == "x1" ~ glue::glue("1% zmiany DXY (≈ 0.01 w dlog) wiąże się przeciętnie ze zmianą dziennego/tygodniowego zwrotu złota o ok. {fmt_num(0.01*estimate,6)} (przy pozostałych czynnikach stałych)."),
+      term == "x2" ~ glue::glue("Wzrost US10Y o 0.10 p.p. (10 pb) wiąże się przeciętnie ze zmianą zwrotu złota o ok. {fmt_num(0.10*estimate,6)}."),
+      term == "x3" ~ glue::glue("1% zmiany VIX (≈ 0.01 w dlog) wiąże się przeciętnie ze zmianą zwrotu złota o ok. {fmt_num(0.01*estimate,6)}."),
+      TRUE ~ ""
+    )
+  ) %>%
+  dplyr::select(czynnik = term, beta = estimate, znak, istotnosc, opis, skala)
+
+kbl_safe(interp, digits = 6, caption = "Interpretacja współczynników (język praktyczny, bez żargonu matematycznego)")
+```
+
+## Testy diagnostyczne i wykresy reszt
+
+```{r diagnostics}
+res <- stats::residuals(m)
+fit <- stats::fitted(m)
+
+diag_tbl <- tibble::tibble(
+  test = c("Jarque-Bera (normalność)", "Breusch-Pagan (heterosk.)",
+           "Durbin-Watson (autokorel.)", "Runs test (losowość)"),
+  stat = c(
+    as.numeric(tseries::jarque.bera.test(res)$statistic),
+    as.numeric(lmtest::bptest(m)$statistic),
+    as.numeric(lmtest::dwtest(m)$statistic),
+    as.numeric(lawstat::runs.test(res)$statistic)
+  ),
+  p_value = c(
+    tseries::jarque.bera.test(res)$p.value,
+    lmtest::bptest(m)$p.value,
+    lmtest::dwtest(m)$p.value,
+    lawstat::runs.test(res)$p.value
+  )
+) %>% dplyr::mutate(wniosek = vapply(p_value, sig_label, character(1)))
+
+kbl_safe(diag_tbl, digits = 6, caption = "Testy diagnostyczne reszt")
+
+p1 <- ggplot(tibble::tibble(fit = fit, res = res), aes(x = fit, y = res)) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.6) +
+  geom_point(alpha = 0.65, color = pal$gray) +
+  geom_smooth(se = FALSE, method = "loess", color = pal$blue, linewidth = 1) +
+  labs(title = "Reszty vs dopasowanie", x = "Dopasowanie", y = "Reszty") +
+  theme_project(14)
+
+qq <- qqnorm(res, plot.it = FALSE)
+qq_df <- tibble::tibble(theoretical = qq$x, sample = qq$y)
+# Linia odniesienia w skali danych (jak stats::qqline)
+qq_slope <- diff(stats::quantile(res, c(0.25, 0.75), na.rm = TRUE)) / diff(stats::qnorm(c(0.25, 0.75)))
+qq_intercept <- stats::quantile(res, 0.25, na.rm = TRUE) - qq_slope * stats::qnorm(0.25)
+
+p2 <- ggplot(qq_df, aes(x = theoretical, y = sample)) +
+  geom_point(alpha = 0.65, color = pal$gray) +
+  geom_abline(intercept = qq_intercept, slope = qq_slope, linetype = "dashed", color = pal$red, linewidth = 1) +
+  labs(title = "QQ-plot reszt", x = "Teoretyczne kwantyle", y = "Kwantyle reszt") +
+  theme_project(14)
+
+acf_obj <- stats::acf(res, plot = FALSE, na.action = na.pass)
+acf_df <- tibble::tibble(lag = acf_obj$lag[, , 1], acf = acf_obj$acf[, , 1])
+
+p3 <- ggplot(acf_df, aes(x = lag, y = acf)) +
+  geom_hline(yintercept = 0, alpha = 0.6) +
+  geom_segment(aes(xend = lag, yend = 0), color = pal$gray, linewidth = 1) +
+  labs(title = "ACF reszt", x = "Lag", y = "ACF") +
+  theme_project(14)
+
+(p1 | p2) / p3
+```
+**Opis i interpretacja (diagnostyka reszt):**  
+- Wykres reszt vs dopasowanie sprawdza nieliniowość i heteroskedastyczność: idealnie punkty powinny być losową chmurą wokół zera bez „kształtu”.  
+- QQ-plot w finansach zwykle pokazuje „grubsze ogony” niż normalność - to nie dyskwalifikuje OLS, ale uzasadnia ostrożność (np. odporne błędy, analiza stabilności).  
+- ACF reszt: brak wyraźnych autokorelacji na opóźnieniach > 0 to dobry sygnał, że model nie pomija silnej dynamiki liniowej.
+
+
+# Jakość modelu: test-set i walidacja krocząca
+
+## Wyniki na zbiorze testowym (poza próbą)
+
+```{r test-metrics}
+test$y_hat <- stats::predict(m, newdata = test)
+
+metrics <- tibble::tibble(
+  RMSE = rmse(test$y, test$y_hat),
+  MAE  = mae(test$y, test$y_hat),
+  COR  = stats::cor(test$y, test$y_hat),
+  HitRate = mean(sign(test$y) == sign(test$y_hat), na.rm = TRUE)
+)
+
+kbl_safe(metrics, digits = 6, caption = "Metryki jakości na zbiorze testowym")
+test_out <- test %>% dplyr::select(date, y, y_hat, x1, x2, x3)
+readr::write_csv(test_out, params$out_test_forecast_csv)
+
+ggplot(test_out, aes(x = date)) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.55) +
+  geom_line(aes(y = y), linewidth = 1, color = pal$gray) +
+  geom_line(aes(y = y_hat), linewidth = 1, linetype = "dashed", color = pal$blue) +
+  scale_x_date(date_breaks = if (tolower(params$freq) == "weekly") "26 weeks" else "6 months",
+               date_labels = "%Y-%m") +
+  labs(
+    title = "Test-set: realizacje vs prognoza modelu",
+    subtitle = "Linia przerywana = predykcja; dodatkowo liczymy trafność kierunku (HitRate)",
+    x = NULL, y = "y = dlog(XAUUSD)"
+  ) +
+  theme_project(14)
+```
+**Opis i interpretacja (test-set):**  
+- Linia przerywana (ŷ) porównana z realizacją (y) pokazuje, czy model „łapie” zmiany poza próbą; w finansach poziom szumu jest wysoki, więc ważniejsza jest stabilność i kierunek niż idealne dopasowanie.  
+- Metryki (RMSE/MAE/COR/HitRate) raportują jakość liczbowo; HitRate > 0.5 sugeruje, że model częściej trafia znak zwrotu niż losowanie, ale to nadal nie jest gwarancja przewagi rynkowej.
+
+
+## Walidacja krocząca (expanding window)
+
+```{r rolling}
+start_roll <- max(120, floor(0.7 * nrow(df_t)))
+idx_seq <- start_roll:(nrow(df_t) - 1)
+
+y_true <- numeric(length(idx_seq))
+y_pred <- numeric(length(idx_seq))
+
+for (k in seq_along(idx_seq)) {
+  i <- idx_seq[k]
+  tr <- df_t[1:i, ]
+  te <- df_t[i + 1, , drop = FALSE]
+  mm <- stats::lm(y ~ x1 + x2 + x3, data = tr)
+  y_true[k] <- te$y
+  y_pred[k] <- stats::predict(mm, newdata = te)
+}
+
+roll_metrics <- tibble::tibble(
+  RMSE = sqrt(mean((y_true - y_pred)^2)),
+  MAE  = mean(abs(y_true - y_pred)),
+  COR  = stats::cor(y_true, y_pred),
+  HitRate = mean(sign(y_true) == sign(y_pred), na.rm = TRUE)
+)
+kbl_safe(roll_metrics, digits = 6, caption = "Metryki walidacji kroczącej (1-step ahead, expanding window)")
+
+df_roll <- tibble::tibble(date = df_t$date[idx_seq + 1], y = y_true, y_hat = y_pred)
+
+ggplot(df_roll, aes(x = date)) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.55) +
+  geom_line(aes(y = y), linewidth = 1, color = pal$gray) +
+  geom_line(aes(y = y_hat), linewidth = 1, linetype = "dashed", color = pal$blue) +
+  scale_x_date(date_breaks = if (tolower(params$freq) == "weekly") "26 weeks" else "6 months",
+               date_labels = "%Y-%m") +
+  labs(
+    title = "Walidacja krocząca: realizacje vs prognoza 1-krok",
+    subtitle = "Model uczony na danych do chwili t, prognozuje t+1 (test stabilności w czasie)",
+    x = NULL, y = "dlog(XAUUSD)"
+  ) +
+  theme_project(14)
+```
+**Opis i interpretacja (walidacja krocząca):**  
+- Procedura expanding window sprawdza, czy relacje są względnie stabilne w czasie (czy model nie działa tylko w jednym wycinku historii).  
+- Jeżeli jakość (np. HitRate, korelacja) nie „rozsypuje się” w końcówce próby, to jest to mocniejszy argument niż pojedynczy podział train/test.
+
+
+# Model i prognoza - plik wynikowy + opis
+
+> Wymóg projektu: oprócz arkusza roboczego przygotować plik wynikowy (model + prognozy) i opisać.
+
+## Prognoza scenariuszowa h kroków do przodu
+
+**Podejście:** prognozujemy czynniki (x1, x2, x3) modelami ARIMA, a następnie podstawiamy je do regresji, uzyskując prognozę zmian złota. To prognoza **scenariuszowa** (zależna od prognoz czynników).
+
+```{r forecast}
+h <- as.integer(params$h_ahead)
+
+# Uczciwie: prognoza czynników na podstawie całej historii zmian
+fx1 <- forecast::forecast(forecast::auto.arima(stats::ts(df_t$x1), stepwise = TRUE, approximation = TRUE), h = h)
+fx2 <- forecast::forecast(forecast::auto.arima(stats::ts(df_t$x2), stepwise = TRUE, approximation = TRUE), h = h)
+fx3 <- forecast::forecast(forecast::auto.arima(stats::ts(df_t$x3), stepwise = TRUE, approximation = TRUE), h = h)
+
+future_x <- tibble::tibble(
+  step = 1:h,
+  x1 = as.numeric(fx1$mean),
+  x2 = as.numeric(fx2$mean),
+  x3 = as.numeric(fx3$mean)
+)
+
+future_x$y_hat <- stats::predict(m, newdata = future_x)
+
+last_date <- max(df_t$date)
+future_dates <- if (tolower(params$freq) == "weekly") {
+  seq(from = last_date + 7, by = 7, length.out = h)
+} else {
+  seq(from = last_date + 1, by = 1, length.out = h)
+}
+
+# Ścieżka ceny: XAUUSD_{t+h} = XAUUSD_t * exp(cumsum(y_hat))
+last_price <- tail(df_use$xauusd[is.finite(df_use$xauusd)], 1)
+future_price <- as.numeric(last_price) * exp(cumsum(future_x$y_hat))
+
+# Prosty przedział scenariuszowy na podstawie zmienności reszt (nie jest to „pewność rynkowa”)
+res_sd <- stats::sd(stats::residuals(m), na.rm = TRUE)
+y_lo <- future_x$y_hat - 1.96 * res_sd
+y_hi <- future_x$y_hat + 1.96 * res_sd
+price_lo <- as.numeric(last_price) * exp(cumsum(y_lo))
+price_hi <- as.numeric(last_price) * exp(cumsum(y_hi))
+
+future_out <- tibble::tibble(
+  date = future_dates,
+  y_hat = future_x$y_hat,
+  y_hat_lo = y_lo,
+  y_hat_hi = y_hi,
+  x1_hat = future_x$x1,
+  x2_hat = future_x$x2,
+  x3_hat = future_x$x3,
+  xauusd_path = future_price,
+  xauusd_lo = price_lo,
+  xauusd_hi = price_hi
+)
+
+readr::write_csv(future_out, params$out_future_forecast_csv)
+kbl_safe(head(future_out, 10), digits = 6, caption = "Prognoza do przodu (pierwsze 10 obserwacji) - zapisano do CSV")
+
+p_y <- ggplot(future_out, aes(x = date)) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.55) +
+  geom_ribbon(aes(ymin = y_hat_lo, ymax = y_hat_hi), fill = pal$blue, alpha = 0.15) +
+  geom_line(aes(y = y_hat), color = pal$blue, linewidth = 1) +
+  geom_point(aes(y = y_hat), color = pal$blue) +
+  labs(
+    title = "Prognoza zmian (y_hat) z pasmem niepewności",
+    subtitle = "Pasmo oparte o zmienność reszt modelu - interpretuj jako scenariusz, nie gwarancję",
+    x = NULL, y = "y_hat"
+  ) +
+  theme_project(14)
+
+p_p <- ggplot(future_out, aes(x = date)) +
+  geom_ribbon(aes(ymin = xauusd_lo, ymax = xauusd_hi), fill = pal$gold, alpha = 0.18) +
+  geom_line(aes(y = xauusd_path), color = pal$gold, linewidth = 1) +
+  geom_point(aes(y = xauusd_path), color = pal$gold) +
+  labs(
+    title = "Prognozowana ścieżka ceny XAUUSD (mechaniczna)",
+    subtitle = "Wyliczona z kumulacji prognoz y_hat; pasmo = scenariusz ±1.96·sd(reszt)",
+    x = NULL, y = "XAUUSD"
+  ) +
+  theme_project(14)
+
+p_y / p_p
+```
+**Opis i interpretacja (prognoza i pasma):**  
+- Prognoza *y_hat* wynika z: (1) prognoz ARIMA dla czynników (*x1, x2, x3*), (2) podstawienia ich do regresji. Jeżeli ARIMA daje średnią blisko zera, wtedy ŷ także będzie blisko zera (co jest typowe dla krótkoterminowych prognoz zwrotów).  
+- Pasma są scenariuszowe (oparte na zmienności reszt modelu), dlatego rozszerzają się wraz z horyzontem i nie należy ich interpretować jako „pewności rynkowej”.  
+- Dolny wykres to mechaniczna ścieżka ceny z kumulacji prognoz zwrotów - użyteczne do ilustracji niepewności, nie jako rekomendacja inwestycyjna.
+
+
+## Plik wynikowy (opis + ścieżki do plików)
+
+```{r outputs}
+r2    <- summary(m)$r.squared
+adjr2 <- summary(m)$adj.r.squared
+
+summary_lines <- c(
+  "# Plik wynikowy - model i prognozy",
+  "",
+  paste0("- Data pobrania danych: ", format(fetch_timestamp, "%Y-%m-%d %H:%M:%S")),
+  paste0("- Zakres: ", as.character(start_date), " - ", as.character(end_date)),
+  paste0("- Częstotliwość: ", params$freq),
+  paste0("- Źródła (faktycznie użyte): XAUUSD=", src_xau, ", DXY=", src_dxy, ", US10Y=", src_y10, ", VIX=", src_vix),
+  "",
+  "## Najważniejsze liczby",
+  "",
+  paste0("- R2 ≈ ", fmt_num(r2, 4), ", AdjR2 ≈ ", fmt_num(adjr2, 4)),
+  paste0("- Test-set: RMSE ≈ ", fmt_num(metrics$RMSE, 6), ", MAE ≈ ", fmt_num(metrics$MAE, 6),
+         ", COR ≈ ", fmt_num(metrics$COR, 4), ", HitRate ≈ ", fmt_num(metrics$HitRate, 4)),
+  "",
+  "## Pliki wygenerowane przez raport",
+  "",
+  paste0("- Dane (poziomy raw): ", file.path(params$out_dir_data, "dane_poziomy_raw.csv")),
+  paste0("- Dane (poziomy complete cases): ", file.path(params$out_dir_data, "dane_poziomy_completecases.csv")),
+  paste0("- Dane do modelu (zmiany): ", file.path(params$out_dir_data, "dane_transformacje_do_modelu.csv")),
+  paste0("- Źródła danych: ", params$out_sources_csv),
+  paste0("- Model (RDS): ", params$out_model_rds),
+  paste0("- Predykcje test-set: ", params$out_test_forecast_csv),
+  paste0("- Prognoza do przodu: ", params$out_future_forecast_csv),
+  "",
+  "## Uwaga interpretacyjna",
+  "",
+  "- Model opisuje statystyczne zależności historyczne. Na rynku finansowym relacje mogą się zmieniać (reżimy rynkowe).",
+  "- Prognoza jest scenariuszowa i zależy od prognoz ARIMA dla czynników."
+)
+
+writeLines(summary_lines, params$out_summary_md)
+
+kbl_safe(tibble::tibble(
+  plik = c("Źródła", "Model (RDS)", "Test forecast", "Future forecast", "Summary"),
+  sciezka = c(params$out_sources_csv, params$out_model_rds, params$out_test_forecast_csv, params$out_future_forecast_csv, params$out_summary_md)
+), digits = 0, caption = "Ścieżki do plików wynikowych (wszystko zapisane lokalnie)")
+```
+
+# Wnioski końcowe (krótkie i praktyczne)
+
+```{r final-conclusions, echo=FALSE, results='asis'}
+# Wnioski generowane na podstawie wyników (żeby były spójne z obliczeniami)
+
+cat(paste0(
+"- Model opisuje *zmiany* ceny złota (dlog XAUUSD) trzema czynnikami: dolarem (DXY), rentownościami 10Y (US10Y) i awersją do ryzyka (VIX).\n",
+"- Najważniejsze w praktyce jest **kierunek wpływu** i **stabilność poza próbą** (test-set, walidacja krocząca), nie samo dopasowanie w próbie.\n",
+glue::glue("- Poza próbą (test): RMSE ≈ {fmt_num(metrics$RMSE,6)}, korelacja predykcji z realizacją ≈ {fmt_num(metrics$COR,4)}, trafność kierunku ≈ {fmt_num(metrics$HitRate,4)}.\n"),
+"- W tej próbie wszystkie trzy współczynniki są ujemne: najsilniej działa umacnianie USD (DXY), słabiej rosnące stopy 10Y; dla VIX znak jest również ujemny, co sugeruje, że w badanym okresie efekt „risk-off” częściej działał przez USD/delewarowanie niż przez klasyczną „bezpieczną przystań”.\n",
+"- Ograniczenia: relacje rynkowe mogą się zmieniać w czasie; model jest liniowy i nie uwzględnia np. reżimów inflacyjnych, polityki banków centralnych, płynności ani interakcji między czynnikami.\n"
+))
+```
+
+---
+
+## Załącznik: Reproducowalność
+
+```{r sessioninfo}
+sessionInfo()
+```

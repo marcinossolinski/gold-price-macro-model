@@ -1,0 +1,8 @@
+data_out/
+output_out/
+*.html
+*.pdf
+*.tex
+.Rhistory
+.RData
+.Rproj.user/
